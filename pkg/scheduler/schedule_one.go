@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"k8s.io/kubernetes/pkg/controller/dummyk8s"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -298,6 +299,11 @@ func (sched *Scheduler) bindingCycle(
 	// Run "bind" plugins.
 	if status := sched.bind(ctx, fwk, assumedPod, scheduleResult.SuggestedHost, state); !status.IsSuccess() {
 		return status
+	}
+
+	// force pod running if possible
+	if err := forcePodRunning(ctx, fwk.ClientSet(), assumedPod, scheduleResult.SuggestedHost); err != nil {
+		return framework.NewStatus(500, "force pod running").WithError(err)
 	}
 
 	// Calculating nodeResourceString can be heavy. Avoid it if klog verbosity is below 2.
@@ -1122,4 +1128,77 @@ func updatePod(ctx context.Context, client clientset.Interface, pod *v1.Pod, con
 		podStatusCopy.NominatedNodeName = nominatingInfo.NominatedNodeName
 	}
 	return util.PatchPodStatus(ctx, client, pod, podStatusCopy)
+}
+
+func forcePodRunning(ctx context.Context, client clientset.Interface, pod *v1.Pod, nodeName string) error {
+	logger := klog.FromContext(ctx)
+
+	n, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		logger.Error(err, "failed retrieving node "+nodeName+" for pod "+pod.Namespace+"/"+pod.Name)
+		return err
+	}
+	if _, exists := n.Annotations[dummyk8s.AnnotationNodeInternalIP]; !exists {
+		logger.V(1).Info(n.Name + " is not a dummy-k8s node")
+		return nil
+	}
+	logger.Info("force pod running for " + pod.Namespace + "/" + pod.Name + " because it's scheduled")
+
+	pod, err = client.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if !pod.Spec.HostNetwork {
+		logger.Info("pod " + pod.Namespace + "/" + pod.Name + " is not processed because it's not a hostNetwork pod")
+		return nil
+	}
+
+	pod.Status.Phase = v1.PodRunning
+	podutil.UpdatePodCondition(&pod.Status, &v1.PodCondition{
+		Type:               v1.PodReady,
+		Status:             v1.ConditionTrue,
+		LastProbeTime:      metav1.Now(),
+		LastTransitionTime: metav1.Now(),
+		Reason:             "ForceReady",
+		Message:            "force ready",
+	})
+
+	var containerStatuses []v1.ContainerStatus
+	for _, container := range pod.Spec.Containers {
+		started := true
+		containerStatuses = append(containerStatuses, v1.ContainerStatus{
+			Name:                 container.Name,
+			State:                v1.ContainerState{Running: &v1.ContainerStateRunning{StartedAt: metav1.Now()}},
+			LastTerminationState: v1.ContainerState{},
+			Ready:                true,
+			RestartCount:         0,
+			Started:              &started,
+		})
+	}
+	pod.Status.ContainerStatuses = containerStatuses
+
+	for _, a := range n.Status.Addresses {
+		if a.Type == v1.NodeInternalIP {
+			pod.Status.PodIP = a.Address
+			break
+		}
+	}
+	var ips []v1.PodIP
+	var hostips []v1.HostIP
+	for _, a := range n.Status.Addresses {
+		if a.Type == v1.NodeInternalIP {
+			ips = append(ips, v1.PodIP{IP: a.Address})
+			hostips = append(hostips, v1.HostIP{IP: a.Address})
+		}
+	}
+	pod.Status.PodIPs = ips
+	pod.Status.HostIP = pod.Status.PodIP
+	pod.Status.HostIPs = hostips
+
+	if _, err = client.CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		logger.Error(err, "failed updating pod status "+pod.Namespace+"/"+pod.Name)
+		return err
+	}
+	logger.Info("pod " + pod.Namespace + "/" + pod.Name + " is forced to transit into running state")
+	return nil
 }

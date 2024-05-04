@@ -24,6 +24,11 @@ package nodelifecycle
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/kubernetes/pkg/controller/dummyk8s"
+	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -831,6 +836,7 @@ func (nc *Controller) tryUpdateNodeHealth(ctx context.Context, node *v1.Node) (t
 	_, currentReadyCondition := controllerutil.GetNodeCondition(&node.Status, v1.NodeReady)
 	if currentReadyCondition == nil {
 		// If ready condition is nil, then kubelet (or nodecontroller) never posted node status.
+		nc.forceInitialNodeReady(ctx, node)
 		// A fake ready condition is created, where LastHeartbeatTime and LastTransitionTime is set
 		// to node.CreationTimestamp to avoid handle the corner case.
 		observedReadyCondition = v1.NodeCondition{
@@ -928,7 +934,18 @@ func (nc *Controller) tryUpdateNodeHealth(ctx context.Context, node *v1.Node) (t
 		nodeHealth.probeTimestamp = nc.now()
 	}
 
-	if nc.now().After(nodeHealth.probeTimestamp.Add(gracePeriod)) {
+	nowTimestamp := nc.now()
+	skipProbe := false
+	if nowTimestamp.After(nodeHealth.probeTimestamp.Add(gracePeriod)) {
+		processed, err := nc.doForceNodeReady(ctx, node, true)
+		if err != nil {
+			return gracePeriod, observedReadyCondition, currentReadyCondition, err
+		}
+		if processed {
+			skipProbe = true
+		}
+	}
+	if nowTimestamp.After(nodeHealth.probeTimestamp.Add(gracePeriod)) && !skipProbe {
 		// NodeReady condition or lease was last set longer ago than gracePeriod, so
 		// update it to Unknown (regardless of its current value) in the master.
 
@@ -941,7 +958,6 @@ func (nc *Controller) tryUpdateNodeHealth(ctx context.Context, node *v1.Node) (t
 			// v1.NodeNetworkUnavailable,
 		}
 
-		nowTimestamp := nc.now()
 		for _, nodeConditionType := range nodeConditionTypes {
 			_, currentCondition := controllerutil.GetNodeCondition(&node.Status, nodeConditionType)
 			if currentCondition == nil {
@@ -1335,4 +1351,97 @@ func (nc *Controller) reconcileNodeLabels(ctx context.Context, nodeName string) 
 		return fmt.Errorf("failed update labels for node %+v", node)
 	}
 	return nil
+}
+
+func (nc *Controller) forceInitialNodeReady(ctx context.Context, node *v1.Node) (bool, error) {
+	logger := klog.FromContext(ctx)
+
+	internalips := node.Annotations[dummyk8s.AnnotationNodeInternalIP]
+	if internalips == "" {
+		msg := "unable to initialize node because no internal IP addresses found, " +
+			"please use annotation `dummy-k8s.vproxy.io/node-internal-ip` to specify ips for node " + node.Name
+		logger.Info(msg)
+		controllerutil.RecordNodeEvent(ctx, nc.recorder, node.Name, string(node.UID), v1.EventTypeWarning, "ForceNodeReadySkipped", msg)
+		return false, nil
+	}
+	ips := strings.Split(internalips, ",")
+	var formattedIps []v1.NodeAddress
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		ipobj := net.ParseIP(ip)
+		if ipobj == nil {
+			msg := ip + " is not a valid ip address in annotation `k3s.io/internal-ip` on node " + node.Name
+			logger.Info(msg)
+			controllerutil.RecordNodeEvent(ctx, nc.recorder, node.Name, string(node.UID), v1.EventTypeWarning, "ForceNodeReadySkipped", msg)
+			return false, nil
+		}
+		formattedIps = append(formattedIps, v1.NodeAddress{
+			Type:    v1.NodeInternalIP,
+			Address: ipobj.String(),
+		})
+	}
+	if len(formattedIps) == 0 {
+		msg := "unable to initialize node because no internal IP addresses found, " +
+			"please use annotation `k3s.io/internal-ip` to specify them for node " + node.Name
+		logger.Info(msg)
+		controllerutil.RecordNodeEvent(ctx, nc.recorder, node.Name, string(node.UID), v1.EventTypeWarning, "ForceNodeReadySkipped", msg)
+		return false, nil
+	}
+
+	logger.Info("force node ready for " + node.Name + " because it's registered")
+
+	node.Status.Phase = v1.NodeRunning
+	node.Status.NodeInfo = v1.NodeSystemInfo{
+		OperatingSystem: runtime.GOOS,
+		Architecture:    runtime.GOARCH,
+	}
+	node.Status.Addresses = formattedIps
+	node.Status.Capacity = v1.ResourceList{
+		v1.ResourceCPU:              resource.MustParse("1048576"),
+		v1.ResourceMemory:           resource.MustParse("1048576Gi"),
+		v1.ResourcePods:             resource.MustParse("1048576"),
+		v1.ResourceEphemeralStorage: resource.MustParse("1048576Gi"),
+	}
+	node.Status.Allocatable = node.Status.Capacity
+	return nc.doForceNodeReady(ctx, node, false)
+}
+
+func (nc *Controller) doForceNodeReady(ctx context.Context, node *v1.Node, readyShouldPresent bool) (bool, error) {
+	logger := klog.FromContext(ctx)
+
+	if _, exists := node.Annotations[dummyk8s.AnnotationNodeInternalIP]; !exists {
+		logger.V(1).Info(node.Name + " is not a dummy-k8s node")
+		return false, nil
+	}
+
+	logger.Info("force node ready for " + node.Name + " because of the grace timeout")
+
+	idx, _ := controllerutil.GetNodeCondition(&node.Status, v1.NodeReady)
+	condition := v1.NodeCondition{
+		Type:               v1.NodeReady,
+		Status:             v1.ConditionTrue,
+		LastHeartbeatTime:  metav1.Now(),
+		LastTransitionTime: metav1.Now(),
+		Reason:             "ForceReady",
+		Message:            "force ready",
+	}
+	if idx != -1 {
+		node.Status.Conditions[idx] = condition
+	} else {
+		if readyShouldPresent {
+			logger.Info("node " + node.Name + " is never ready, will go through initialization process")
+			return nc.forceInitialNodeReady(ctx, node)
+		}
+		node.Status.Conditions = append(node.Status.Conditions, condition)
+	}
+	if _, err := nc.kubeClient.CoreV1().Nodes().UpdateStatus(ctx, node, metav1.UpdateOptions{}); err != nil {
+		logger.Error(err, "failed updating node status for "+node.Name)
+		return true, err
+	} else {
+		logger.Info("node " + node.Name + " is forced to transit into ready state")
+		return true, nil
+	}
 }

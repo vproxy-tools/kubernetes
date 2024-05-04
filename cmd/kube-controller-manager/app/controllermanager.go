@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/kubernetes/cmd/shared"
 	"math/rand"
 	"net/http"
 	"os"
@@ -133,8 +134,11 @@ controller, and serviceaccounts controller.`,
 			// Activate logging as soon as possible, after that
 			// show flags with the final logging configuration.
 			if err := logsapi.ValidateAndApply(s.Logs, utilfeature.DefaultFeatureGate); err != nil {
-				return err
+				if !shared.LogIsInitiated {
+					return err
+				}
 			}
+			shared.LogIsInitiated = true
 			cliflag.PrintFlags(cmd.Flags())
 
 			c, err := s.Config(KnownControllers(), ControllersDisabledByDefault(), ControllerAliases())

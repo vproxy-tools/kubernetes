@@ -22,6 +22,7 @@ package app
 import (
 	"crypto/tls"
 	"fmt"
+	"k8s.io/kubernetes/cmd/shared"
 	"net/http"
 	"net/url"
 	"os"
@@ -99,8 +100,11 @@ cluster's shared state through which all other components interact.`,
 			// Activate logging as soon as possible, after that
 			// show flags with the final logging configuration.
 			if err := logsapi.ValidateAndApply(s.Logs, utilfeature.DefaultFeatureGate); err != nil {
-				return err
+				if !shared.LogIsInitiated {
+					return err
+				}
 			}
+			shared.LogIsInitiated = true
 			cliflag.PrintFlags(fs)
 
 			// set default options
@@ -115,7 +119,7 @@ cluster's shared state through which all other components interact.`,
 			}
 			// add feature enablement metrics
 			utilfeature.DefaultMutableFeatureGate.AddMetrics()
-			return Run(completedOptions, genericapiserver.SetupSignalHandler())
+			return Run(completedOptions, shared.SetupSignalHandler())
 		},
 		Args: func(cmd *cobra.Command, args []string) error {
 			for _, arg := range args {

@@ -1108,6 +1108,13 @@ func (e *Store) Delete(ctx context.Context, name string, deleteValidation rest.V
 	if options == nil {
 		options = metav1.NewDeleteOptions(0)
 	}
+
+	// always force delete pods
+	isPod := qualifiedResource.Group == "" && qualifiedResource.Resource == "pods"
+	if isPod {
+		options = metav1.NewDeleteOptions(0)
+	}
+
 	var preconditions storage.Preconditions
 	if options.Preconditions != nil {
 		preconditions.UID = options.Preconditions.UID

@@ -20,6 +20,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"k8s.io/kubernetes/cmd/shared"
 	"net/http"
 	"os"
 	goruntime "runtime"
@@ -32,7 +33,6 @@ import (
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/apiserver/pkg/server"
 	genericfilters "k8s.io/apiserver/pkg/server/filters"
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/apiserver/pkg/server/mux"
@@ -124,15 +124,18 @@ func runCommand(cmd *cobra.Command, opts *options.Options, registryOptions ...Op
 	// Activate logging as soon as possible, after that
 	// show flags with the final logging configuration.
 	if err := logsapi.ValidateAndApply(opts.Logs, utilfeature.DefaultFeatureGate); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		if !shared.LogIsInitiated {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
 	}
+	shared.LogIsInitiated = true
 	cliflag.PrintFlags(cmd.Flags())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		stopCh := server.SetupSignalHandler()
+		stopCh := shared.SetupSignalHandler()
 		<-stopCh
 		cancel()
 	}()
