@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	etcd "go.etcd.io/etcd/server/v3/embed"
 	"k8s.io/component-base/cli"
 	apiserver "k8s.io/kubernetes/cmd/kube-apiserver/app"
 	controller "k8s.io/kubernetes/cmd/kube-controller-manager/app"
@@ -32,6 +33,18 @@ func main() {
 
 	launchedModuleCnt := 0
 
+	if newArgs, ok := rebuildArgs(args, "etcd"); ok {
+		launchedModuleCnt += 1
+		go func() {
+			code := runEtcd(newArgs)
+			errChan <- launchErr{
+				exitCode: code,
+				module:   "etcd",
+			}
+		}()
+		exitOrWait(errChan)
+	}
+
 	if newArgs, ok := rebuildArgs(args, "kube-apiserver"); ok {
 		launchedModuleCnt += 1
 		go func() {
@@ -61,6 +74,7 @@ func main() {
 	}
 
 	if newArgs, ok := rebuildArgs(args, "kube-controller-manager"); ok {
+		launchedModuleCnt += 1
 		go func() {
 			controllerCommand := controller.NewControllerManagerCommand()
 			controllerCommand.SetArgs(newArgs)
@@ -89,7 +103,8 @@ func printHelpMsg() {
 	fmt.Println("    apiserver \\")
 	fmt.Println("        --kube-apiserver-- $args_for_kube_apiserver \\")
 	fmt.Println("        --kube-scheduler-- $args_for_kube_scheduler \\")
-	fmt.Println("        --kube-controller-manager-- $args_for_kube_controller_manager")
+	fmt.Println("        --kube-controller-manager-- $args_for_kube_controller_manager \\")
+	fmt.Println("        --etcd-- $args_for_etcd")
 }
 
 func rebuildArgs(args []string, module string) ([]string, bool) {
@@ -122,6 +137,54 @@ func rebuildArgs(args []string, module string) ([]string, bool) {
 	fmt.Printf("args rebuilt to: %+v\n", ret)
 	fmt.Println("=====================================")
 	return ret, true
+}
+
+func runEtcd(args []string) int {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" || arg == "-help" || arg == "help" {
+			fmt.Println("etcd --config-file {...}")
+			return 0
+		}
+	}
+	var configFile string
+	for i := 0; i < len(args); i += 1 {
+		arg := args[i]
+		var nxt *string = nil
+		if i < len(args)-1 {
+			nxt = &args[i+1]
+		}
+		if arg == "--config-file" {
+			if nxt == nil {
+				fmt.Println("missing config file")
+				return 1
+			}
+			configFile = strings.TrimSpace(*nxt)
+		} else if strings.HasPrefix(arg, "--config-file=") {
+			configFile = strings.TrimSpace(arg[len("--config-file="):])
+		} else {
+			fmt.Println("unknown argument: " + arg)
+			return 1
+		}
+	}
+	if configFile == "" {
+		fmt.Println("missing --config-file")
+		return 1
+	}
+
+	cfg, err := etcd.ConfigFromFile(configFile)
+	if err != nil {
+		fmt.Printf("Failed to read etcd config: %v\n", err)
+		return 1
+	}
+	e, err := etcd.StartEtcd(cfg)
+	if err != nil {
+		fmt.Printf("Failed to start etcd: %v\n", err)
+		return 1
+	}
+	defer e.Close()
+	chnl := make(chan int)
+	<-chnl
+	return 1
 }
 
 func exitOrWait(errChan chan launchErr) {
